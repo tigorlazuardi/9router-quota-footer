@@ -129,10 +129,11 @@ Lightweight; this is a local UI plugin, but still instrument the moving parts:
 ```
 pi-9router-quota/
   package.json            # name, pi.extensions entry, deps (none beyond pi runtime ideally)
-  src/index.ts            # plugin: events, throttle, fetch, footer render, hide/show
+  src/index.ts            # plugin: events, throttle, fetch, footer render, hide/show; wires wakeup hook
   src/adapters/types.ts   # QuotaAdapter, QuotaResponse types
   src/adapters/claude-code.ts  # ClaudeCodeAdapter (the only one now)
   src/config.ts           # resolve baseUrl (env > 9router-config.json > default)
+  src/wakeup.ts           # rate-limit wakeup: 429 hook, timer, sendUserMessage resume (Feature 2)
   README.md
 ```
 
@@ -154,4 +155,96 @@ Track in chezmoi after it works.
 
 - Exact shape of `ctx.model` at `session_start` (provider/id accessors) — doc is terse; the implementer
   should introspect the live type during build and read provider+id the same way `model_select` exposes them.
+
+---
+
+# Feature 2 — Rate-Limit Wakeup
+
+Same package, separate concern from the footer. When THIS session hits a provider rate limit, the
+plugin schedules a wakeup so the SAME agent auto-resumes the previous task once the limit resets.
+No `/loop`, no `/ralph`, no spawned process — pure event hook + timer + in-session message injection.
+
+## Goals / non-goals
+
+- **Goal:** on a `429`, compute time-to-reset, and when it elapses inject a wakeup message into the
+  same session that triggers a turn so the agent continues where it left off.
+- **Goal:** work in a plain interactive session — NOT tied to loop/ralph concepts.
+- **Goal:** generic wakeup message; the agent reads its own history to recall the task (minimal state).
+- **Non-goal:** disk persistence / cross-process revival. If the TUI process closes, the pending
+  wakeup is lost (see Risks). Acceptable per user — this is "same agent resumes", not a durable queue.
+- **Non-goal:** spawning a new agent or scheduler loop.
+
+## Resolved decisions
+
+- **Reset-time source:** BOTH. `429` `retry-after` header is PRIMARY; nearest 9router quota `resetAt`
+  (session 5h / weekly 7d) is FALLBACK when the header is missing.
+- **Who resumes:** the SAME session/agent (context still in the window).
+- **Wakeup message:** GENERIC — `"rate limit reset, lanjutkan task sebelumnya"`.
+
+## Confirmed pi API (verified in installed pi docs/examples)
+
+- **Trigger hook:** `after_provider_response` exposes `event.status` and `event.headers`. On
+  `event.status === 429`, read `event.headers["retry-after"]` (extensions.md ~L646-700). Header
+  availability depends on provider/transport — hence the `resetAt` fallback.
+- **Wakeup:** `pi.sendUserMessage(text)` (always triggers a turn when idle) or
+  `pi.sendMessage({...}, { triggerTurn: true })` injects into the SAME session and runs a turn
+  (extensions.md ~L1353-1400).
+- **Precedent:** `examples/extensions/file-trigger.ts` — watcher → `sendMessage` + `triggerTurn`.
+  Wakeup is the same pattern, timer-driven instead of file-driven.
+- **Timer placement:** timers are allowed INSIDE event handlers (like `fs.watch` inside
+  `session_start`), but NOT in the extension factory (docs L221). Register the hook, keep the timer
+  in module/handler scope.
+
+## Architecture
+
+```
+after_provider_response(event)
+  └─ event.status === 429 ?
+        │ yes
+  delay = parse(event.headers["retry-after"])        // seconds OR HTTP-date
+        └─ missing? → delay = nearest quota resetAt − now   // fallback (reuse footer fetch)
+  clear any existing timer                            // single active timer
+  timer = setTimeout(delay + small jitter, () => {
+     if (session still active && user hasn't resumed manually)
+        pi.sendUserMessage("rate limit reset, lanjutkan task sebelumnya")  // triggers turn
+  })
+```
+
+- **Single timer:** at most one pending wakeup. A new `429` clears + replaces it.
+- **Cancel on manual resume:** if the user sends a prompt / the agent runs again before the timer
+  fires, cancel the pending timer to avoid a double-trigger (watch `turn_start` /
+  `before_agent_start` to detect activity).
+- **`retry-after` parsing:** handle both forms — integer seconds and HTTP-date — per RFC 7231.
+- **Sanity clamp:** ignore absurd/negative delays; optionally cap very long delays and log.
+
+## Telemetry (part of done)
+
+Debug-gated (same `NINE_ROUTER_QUOTA_DEBUG=1` flag):
+- `429` caught (status, raw `retry-after` value).
+- delay computed + SOURCE (`retry-after` vs `resetAt` fallback).
+- timer scheduled / replaced / cancelled.
+- wakeup fired (and whether it was skipped due to inactivity/manual-resume).
+
+## Risks
+
+- **Long delays (process death):** `setTimeout` dies if the TUI process closes. Fine for short
+  `retry-after` (secs–mins). For a weekly (7d) reset the wakeup only fires if the session stays open.
+  Inherent limit of "same agent resumes" without disk persistence — accepted (out of scope now).
+- **Header availability:** some providers/transports don't expose `retry-after`; `resetAt` fallback
+  covers that, but if BOTH are unavailable the wakeup can't be scheduled (log + skip).
+- **Race — manual resume:** user resumes before the timer fires → must cancel the pending timer.
+- **`retry-after` format ambiguity:** seconds vs HTTP-date — implementer must handle both.
+
+## Acceptance criteria (wakeup)
+
+1. A `429` with a `retry-after: <seconds>` header schedules exactly one timer; when it elapses the
+   session receives a user message `"rate limit reset, lanjutkan task sebelumnya"` and a turn runs.
+2. A `429` WITHOUT a usable `retry-after` header falls back to the nearest quota `resetAt` for the
+   delay; debug log records the fallback source.
+3. A second `429` before the first fires REPLACES the timer (never two concurrent wakeups).
+4. If the user manually resumes (new prompt / agent activity) before the timer fires, the pending
+   timer is cancelled — no double-trigger.
+5. Negative/absurd `retry-after` values are clamped/ignored, not scheduled blindly.
+6. All wakeup logging is debug-gated; nothing prints in normal operation.
+7. Feature is independent of `/loop` and `/ralph` — works in a plain interactive session.
 ```
